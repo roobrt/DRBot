@@ -14,15 +14,25 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 load_dotenv()
-RAPIDAPI_KEY = os.getenv('RAPIDAPI_KEY')
-DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+
+# --- CONFIGURATION: SET YOUR CHANNEL IDS HERE ---
+CHANNEL_ID_6MANS = int(os.getenv("CHANNEL_ID_6MANS", 0))
+CHANNEL_ID_4MANS = int(os.getenv("CHANNEL_ID_4MANS", 0))
+CHANNEL_ID_2MANS = int(os.getenv("CHANNEL_ID_2MANS", 0))
 
 keep_alive()
 
 # Discord bot setup
 intents = discord.Intents.default()
 intents.message_content = True 
+intents.guilds = True
 bot = commands.Bot(command_prefix='!', intents=intents)
+
+# Dictionary to track active queue messages
+# Format: { queue_channel_id: (alert_message_id, alert_channel_id) }
+active_queue_messages = {}
 
 def fetch_tournaments(region):
     logger.info(f"Fetching tournaments for region, inside time range for: {region}")
@@ -46,6 +56,114 @@ def find_dropshot_tournament(data):
             return tournament
     return None
 
+@tasks.loop(minutes=1)
+async def check_active_queues():
+    """
+    Scans for 'queue-' channels in ALL GUILDS, determines the queue type,
+    sends an embed to the specific channel, and cleans up when finished.
+    """
+    await bot.wait_until_ready()
+
+    # 1. SCAN FOR CURRENT QUEUES IN ALL GUILDS
+    current_queue_channels = []
+    
+    for guild in bot.guilds:
+        # Explicitly fetch channels (safer than cache sometimes)
+        for channel in guild.text_channels:
+            if channel.name.startswith('queue-'):
+                current_queue_channels.append(channel)
+
+    # 2. HANDLE NEW QUEUES
+    for channel in current_queue_channels:
+        # Check if we are already tracking this queue
+        if channel.id in active_queue_messages:
+            continue
+
+        try:
+            # Fetch the first 2 messages. 
+            # oldest_first=True means index 0 is oldest, index 1 is 2nd oldest.
+            messages = [msg async for msg in channel.history(limit=2, oldest_first=True)]
+
+            if len(messages) >= 2:
+                target_message = messages[1]
+                mentions = target_message.mentions
+                player_count = len(mentions)
+
+                destination_channel_id = None
+                queue_type_name = "Queue"
+
+                if player_count == 6:
+                    queue_type_name = "6mans"
+                    destination_channel_id = CHANNEL_ID_6MANS
+                elif player_count == 4:
+                    queue_type_name = "4mans"
+                    destination_channel_id = CHANNEL_ID_4MANS
+                elif player_count == 2:
+                    queue_type_name = "2mans"
+                    destination_channel_id = CHANNEL_ID_2MANS
+
+                # If matches a valid queue size
+                if destination_channel_id:
+                    # Robust Channel Fetching (Cache -> API Fallback)
+                    dest_channel = bot.get_channel(destination_channel_id)
+                    if dest_channel is None:
+                        try:
+                            dest_channel = await bot.fetch_channel(destination_channel_id)
+                        except discord.Forbidden:
+                            logger.error(f"❌ Bot cannot access destination channel {destination_channel_id}")
+                            continue
+                        except discord.NotFound:
+                            logger.error(f"❌ Destination channel {destination_channel_id} not found!")
+                            continue
+                        except Exception:
+                            continue # Skip silently if other errors
+
+                    if dest_channel:
+                        # Build the Embed
+                        player_names = "\n".join([f"• {m.display_name}" for m in mentions])
+                        
+                        embed = discord.Embed(
+                            title=f"Active {queue_type_name} Ongoing!",
+                            description=f"**Lobby:** {channel.name}", 
+                            color=discord.Color.green(),
+                        )
+                        embed.add_field(name="Players", value=player_names, inline=False)
+                        
+                        # Send and Track
+                        sent_msg = await dest_channel.send(embed=embed)
+                        
+                        active_queue_messages[channel.id] = (sent_msg.id, destination_channel_id)
+                        logger.info(f"Started tracking {queue_type_name} in {channel.name}")
+
+        except discord.Forbidden:
+            logger.warning(f"⚠️ Skipped {channel.name}: Missing Permissions to read messages.")
+            continue 
+        except Exception as e:
+            logger.error(f"❌ Error processing {channel.name}: {e}")
+
+    # 3. CLEANUP ENDED QUEUES
+    current_channel_ids = [c.id for c in current_queue_channels]
+    ended_queues = [cid for cid in active_queue_messages if cid not in current_channel_ids]
+
+    for q_id in ended_queues:
+        msg_id, dest_channel_id = active_queue_messages[q_id]
+        
+        try:
+            dest_channel = bot.get_channel(dest_channel_id)
+            if dest_channel is None:
+                 dest_channel = await bot.fetch_channel(dest_channel_id)
+            
+            if dest_channel:
+                msg_to_delete = await dest_channel.fetch_message(msg_id)
+                await msg_to_delete.delete()
+                logger.info(f"Deleted alert for finished queue (Origin ID: {q_id})")
+        except discord.NotFound:
+            pass # Message already deleted
+        except Exception as e:
+            logger.error(f"Error deleting alert for queue {q_id}: {e}")
+        
+        del active_queue_messages[q_id]
+
 @tasks.loop(minutes=6)
 async def periodic_checks():
     await us_east_dropshot_check()
@@ -59,6 +177,7 @@ async def on_ready():
     if not already_started:
         logger.info(f"✅ Logged in as {bot.user.name}")
         periodic_checks.start()
+        check_active_queues.start()
         already_started = True
 
 @bot.command()
@@ -66,31 +185,6 @@ async def ping(ctx):
     """Replies with Pong! and the bot's latency in ms."""
     latency = round(bot.latency * 1000)  # latency is in seconds, convert to ms
     await ctx.send(f'Pong! ({latency} ms)')
-    
-
-## AUTO-REACT TO COTW MESSAGES
-@bot.event
-async def on_message(message):
-    # Check by channel name instead of channel ID
-    if message.channel.name == "cotw-submissions":
-        await asyncio.sleep(5)  # Wait a bit to ensure the message is fully processed
-        try:
-            # Get the custom upvote and downvote emoji objects by ID
-            upvote_emoji = message.guild.get_emoji(1374485157808963614)
-            # downvote_emoji = message.guild.get_emoji(1374485110048686180)
-            if upvote_emoji:
-                await message.add_reaction(upvote_emoji)
-            else:
-                print("Custom upvote emoji not found.")
-            # Commented out to disable downvote reaction
-            """ if downvote_emoji: 
-                await message.add_reaction(downvote_emoji)
-            else:
-                print("Custom downvote emoji not found.") """
-        except Exception as e:
-            logger.error(f"❌ Failed to add reaction: {e}")
-    await bot.process_commands(message)  # Ensure commands still work
-    
 async def us_east_dropshot_check():
     now = datetime.datetime.now(datetime.timezone.utc)
     # Check window: 18:55–19:05 UTC or 19:25–19:35 UTC (1 hour before both cases)
