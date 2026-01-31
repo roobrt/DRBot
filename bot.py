@@ -135,6 +135,11 @@ async def check_active_queues():
                         active_queue_messages[channel.id] = (sent_msg.id, destination_channel_id)
                         logger.info(f"Started tracking {queue_type_name} in {channel.name}")
 
+        except discord.HTTPException as e:
+            if e.status == 429:
+                logger.critical(f"🛑 RATE LIMIT HIT! Discord says wait {e.retry_after}s. Headers: {e.response.headers}")
+                # Optional: Stop the loop to save your bot
+                break
         except discord.Forbidden:
             logger.warning(f"⚠️ Skipped {channel.name}: Missing Permissions to read messages.")
             continue 
