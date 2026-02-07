@@ -9,30 +9,157 @@ from keep_alive import keep_alive
 from zoneinfo import ZoneInfo
 import logging
 
-# Logger setup
+# --- LOGGING SETUP ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# --- ENVIRONMENT VARIABLES ---
 load_dotenv()
 RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", 0)) 
 
-# --- CONFIGURATION: SET YOUR CHANNEL IDS HERE ---
+if not DISCORD_BOT_TOKEN:
+    raise ValueError("DISCORD_BOT_TOKEN is not set.")
+
+# --- CHANNEL CONFIGURATION ---
 CHANNEL_ID_6MANS = int(os.getenv("CHANNEL_ID_6MANS", 0))
 CHANNEL_ID_4MANS = int(os.getenv("CHANNEL_ID_4MANS", 0))
 CHANNEL_ID_2MANS = int(os.getenv("CHANNEL_ID_2MANS", 0))
 
-keep_alive()
+# --- GLOBAL STATE ---
+# Tracks active match alerts to delete them later
+# Format: { match_channel_id: (alert_message_id, alert_channel_id) }
+active_alerts = {}
 
-# Discord bot setup
+# Tracks announced tournaments to prevent duplicates
+announced_tournaments = set()
+
+# --- BOT SETUP ---
 intents = discord.Intents.default()
 intents.message_content = True 
 intents.guilds = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# Dictionary to track active queue messages
-# Format: { queue_channel_id: (alert_message_id, alert_channel_id) }
-active_queue_messages = {}
+# Start the web server for 24/7 hosting
+keep_alive()
+
+# ==============================================================================
+# 🎯 EVENT LISTENERS (to fix the discord rate limits, hopefully...)
+# ==============================================================================
+
+@bot.event
+async def on_ready():
+    logger.info(f"✅ Logged in as {bot.user.name}")
+    # Start the tournament checker loop
+    if not periodic_checks.is_running():
+        periodic_checks.start()
+
+@bot.event
+async def on_guild_channel_create(channel):
+    """
+    Fires when a new channel is created
+    If it's a match channel, we check it for players and send an alert
+    """
+    # 1. FILTER: Check if the new channel look like a match channel
+    # UPDATE THIS LIST based on what your 6mans bot names the channels, for neatqueue its only "queue-"
+    target_prefixes = ["queue-"]
+    
+    # If the channel name doesn't start with any of the prefixes, ignore it
+    if not any(channel.name.startswith(p) for p in target_prefixes):
+        return
+
+    logger.info(f"🆕 Potential match channel detected: {channel.name} (ID: {channel.id})")
+
+    # 2. Wait 5s for the other bot to post the teams (neatqueue is sometimes slow)
+    await asyncio.sleep(5) 
+
+    try:
+        # 3. FETCH: Read the first few messages to find the bot's team post
+        messages = [msg async for msg in channel.history(limit=5, oldest_first=True)]
+        
+        if not messages:
+            logger.warning(f"⚠️ {channel.name} is empty after 3 seconds.")
+            return
+
+        # Usually the second message contains the mentions (kinda broken if its not ig)
+        target_msg = messages[1] 
+        mentions = target_msg.mentions
+
+        # 4. determine queue type based on player count
+        queue_type = None
+        dest_channel_id = None
+        
+        if len(mentions) == 6:
+            queue_type = "6mans"
+            dest_channel_id = CHANNEL_ID_6MANS
+        elif len(mentions) == 4:
+            queue_type = "4mans"
+            dest_channel_id = CHANNEL_ID_4MANS
+        elif len(mentions) == 2:
+            queue_type = "2mans"
+            dest_channel_id = CHANNEL_ID_2MANS
+        
+        # 5. send alert
+        if dest_channel_id:
+            await send_alert(queue_type, channel, mentions, dest_channel_id)
+
+    except discord.Forbidden:
+        logger.warning(f"❌ Missing permissions to read {channel.name}")
+    except Exception as e:
+        logger.error(f"❌ Error processing new channel {channel.name}: {e}")
+
+@bot.event
+async def on_guild_channel_delete(channel):
+    """
+    Fires when a channel is deleted (Match Finished).
+    We check if we have an active alert for this channel and delete it.
+    """
+    if channel.id in active_alerts:
+        msg_id, dest_channel_id = active_alerts[channel.id]
+        
+        try:
+            dest_channel = bot.get_channel(dest_channel_id)
+            if dest_channel:
+                msg_to_delete = await dest_channel.fetch_message(msg_id)
+                await msg_to_delete.delete()
+                logger.info(f"🗑️ Deleted alert for ended match {channel.name}")
+        except discord.NotFound:
+            pass # Message was already deleted manually
+        except Exception as e:
+            logger.error(f"❌ Error deleting alert: {e}")
+        
+        # Remove from our tracker
+        del active_alerts[channel.id]
+
+# --- HELPER FUNCTIONS ---
+
+async def send_alert(queue_type, origin_channel, mentions, dest_id):
+    dest_channel = bot.get_channel(dest_id)
+    if not dest_channel:
+        logger.error(f"❌ Destination channel {dest_id} not found.")
+        return
+
+    player_names = "\n".join([f"• {m.display_name}" for m in mentions])
+    
+    embed = discord.Embed(
+        title=f"🚨 Active {queue_type} Started!",
+        description=f"**Lobby:** {origin_channel.name}", # Clickable link to channel
+        color=discord.Color.green(),
+    )
+    embed.add_field(name="Players", value=player_names, inline=False)
+    
+    try:
+        sent_msg = await dest_channel.send(embed=embed)
+        # Save the IDs so we can delete this message later
+        active_alerts[origin_channel.id] = (sent_msg.id, dest_id)
+        logger.info(f"📢 Alert sent for {queue_type} in {origin_channel.name}")
+    except Exception as e:
+        logger.error(f"❌ Failed to send alert: {e}")
+
+# ==============================================================================
+# 🏆 TOURNAMENT DETECTION/ALERT LOGIC
+# ==============================================================================
 
 def fetch_tournaments(region):
     logger.info(f"Fetching tournaments for region, inside time range for: {region}")
@@ -56,140 +183,11 @@ def find_dropshot_tournament(data):
             return tournament
     return None
 
-@tasks.loop(minutes=1)
-async def check_active_queues():
-    """
-    Scans for 'queue-' channels in ALL GUILDS, determines the queue type,
-    sends an embed to the specific channel, and cleans up when finished.
-    """
-    await bot.wait_until_ready()
-
-    # 1. SCAN FOR CURRENT QUEUES IN ALL GUILDS
-    current_queue_channels = []
-    
-    for guild in bot.guilds:
-        # Explicitly fetch channels (safer than cache sometimes)
-        for channel in guild.text_channels:
-            if channel.name.startswith('queue-'):
-                current_queue_channels.append(channel)
-
-    # 2. HANDLE NEW QUEUES
-    for channel in current_queue_channels:
-        # Check if we are already tracking this queue
-        if channel.id in active_queue_messages:
-            continue
-
-        try:
-            # Fetch the first 2 messages. 
-            # oldest_first=True means index 0 is oldest, index 1 is 2nd oldest.
-            messages = [msg async for msg in channel.history(limit=2, oldest_first=True)]
-
-            if len(messages) >= 2:
-                target_message = messages[1]
-                mentions = target_message.mentions
-                player_count = len(mentions)
-
-                destination_channel_id = None
-                queue_type_name = "Queue"
-
-                if player_count == 6:
-                    queue_type_name = "6mans"
-                    destination_channel_id = CHANNEL_ID_6MANS
-                elif player_count == 4:
-                    queue_type_name = "4mans"
-                    destination_channel_id = CHANNEL_ID_4MANS
-                elif player_count == 2:
-                    queue_type_name = "2mans"
-                    destination_channel_id = CHANNEL_ID_2MANS
-
-                # If matches a valid queue size
-                if destination_channel_id:
-                    # Robust Channel Fetching (Cache -> API Fallback)
-                    dest_channel = bot.get_channel(destination_channel_id)
-                    if dest_channel is None:
-                        try:
-                            dest_channel = await bot.fetch_channel(destination_channel_id)
-                        except discord.Forbidden:
-                            logger.error(f"❌ Bot cannot access destination channel {destination_channel_id}")
-                            continue
-                        except discord.NotFound:
-                            logger.error(f"❌ Destination channel {destination_channel_id} not found!")
-                            continue
-                        except Exception:
-                            continue # Skip silently if other errors
-
-                    if dest_channel:
-                        # Build the Embed
-                        player_names = "\n".join([f"• {m.display_name}" for m in mentions])
-                        
-                        embed = discord.Embed(
-                            title=f"Active {queue_type_name} Ongoing!",
-                            description=f"**Lobby:** {channel.name}", 
-                            color=discord.Color.green(),
-                        )
-                        embed.add_field(name="Players", value=player_names, inline=False)
-                        
-                        # Send and Track
-                        sent_msg = await dest_channel.send(embed=embed)
-                        
-                        active_queue_messages[channel.id] = (sent_msg.id, destination_channel_id)
-                        logger.info(f"Started tracking {queue_type_name} in {channel.name}")
-
-        except discord.HTTPException as e:
-            if e.status == 429:
-                logger.critical(f"🛑 RATE LIMIT HIT! Discord says wait {e.retry_after}s. Headers: {e.response.headers}")
-                # Optional: Stop the loop to save your bot
-                break
-        except discord.Forbidden:
-            logger.warning(f"⚠️ Skipped {channel.name}: Missing Permissions to read messages.")
-            continue 
-        except Exception as e:
-            logger.error(f"❌ Error processing {channel.name}: {e}")
-
-    # 3. CLEANUP ENDED QUEUES
-    current_channel_ids = [c.id for c in current_queue_channels]
-    ended_queues = [cid for cid in active_queue_messages if cid not in current_channel_ids]
-
-    for q_id in ended_queues:
-        msg_id, dest_channel_id = active_queue_messages[q_id]
-        
-        try:
-            dest_channel = bot.get_channel(dest_channel_id)
-            if dest_channel is None:
-                 dest_channel = await bot.fetch_channel(dest_channel_id)
-            
-            if dest_channel:
-                msg_to_delete = await dest_channel.fetch_message(msg_id)
-                await msg_to_delete.delete()
-                logger.info(f"Deleted alert for finished queue (Origin ID: {q_id})")
-        except discord.NotFound:
-            pass # Message already deleted
-        except Exception as e:
-            logger.error(f"Error deleting alert for queue {q_id}: {e}")
-        
-        del active_queue_messages[q_id]
-
 @tasks.loop(minutes=6)
 async def periodic_checks():
     await us_east_dropshot_check()
     await europe_dropshot_check()
 
-already_started = False
-
-@bot.event
-async def on_ready():
-    global already_started
-    if not already_started:
-        logger.info(f"✅ Logged in as {bot.user.name}")
-        periodic_checks.start()
-        check_active_queues.start()
-        already_started = True
-
-@bot.command()
-async def ping(ctx):
-    """Replies with Pong! and the bot's latency in ms."""
-    latency = round(bot.latency * 1000)  # latency is in seconds, convert to ms
-    await ctx.send(f'Pong! ({latency} ms)')
 async def us_east_dropshot_check():
     now = datetime.datetime.now(datetime.timezone.utc)
     # Check window: 18:55–19:05 UTC or 19:25–19:35 UTC (1 hour before both cases)
@@ -249,6 +247,51 @@ async def check_dropshot_for_region(region: str, display_name: str):
     except Exception as e:
         logger.error(f"❌ Error during check_dropshot_for_region({region}): {e}")
 
-if not DISCORD_BOT_TOKEN:
-    raise ValueError("DISCORD_BOT_TOKEN is not set in the environment variables.")
+# ==============================================================================
+# 🛠️ UTILITY COMMANDS
+# ==============================================================================
+
+@bot.command()
+async def cleanup(ctx):
+    """
+    Manually deletes all active queue alerts the bot is currently tracking.
+    Only works for the ID specified by ADMIN_USER_ID in .env file
+    """
+    if ctx.author.id != ADMIN_USER_ID:
+        await ctx.send("⛔ You are not authorized to use this command.", delete_after=5)
+        return
+
+    if not active_alerts:
+        await ctx.send("🧹 No active alerts to clean up.", delete_after=5)
+        return
+
+    count = 0
+    # Copy items to list because we modify the dictionary during iteration
+    for origin_id, (msg_id, dest_channel_id) in list(active_alerts.items()):
+        try:
+            channel = bot.get_channel(dest_channel_id)
+            if channel:
+                msg = await channel.fetch_message(msg_id)
+                await msg.delete()
+                count += 1
+        except:
+            pass # Already deleted
+    
+    active_alerts.clear()
+    await ctx.send(f"✅ Manually cleared {count} active alerts.", delete_after=5)
+    
+    # Try to delete the command message itself to keep chat clean
+    try:
+        await ctx.message.delete()
+    except:
+        pass
+
+
+@bot.command()
+async def ping(ctx):
+    """Replies with Pong! and the bot's latency in ms."""
+    latency = round(bot.latency * 1000)
+    await ctx.send(f'Pong! ({latency} ms)')
+
+# --- RUN ---
 bot.run(DISCORD_BOT_TOKEN)
