@@ -1,4 +1,7 @@
-import requests
+# import requests
+from pyexpat.errors import messages
+
+import aiohttp
 import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
@@ -77,9 +80,12 @@ async def on_guild_channel_create(channel):
     try:
         # 3. FETCH: Read the first few messages to find the bot's team post
         messages = [msg async for msg in channel.history(limit=5, oldest_first=True)]
+        logger.info(f"📨 Found {len(messages)} message(s) in {channel.name}")
+        for i, msg in enumerate(messages):
+            logger.info(f"  msg[{i}] author={msg.author} | mentions={[m.display_name for m in msg.mentions]} | content={msg.content[:80]!r}")
         
-        if not messages:
-            logger.warning(f"⚠️ {channel.name} is empty after 3 seconds.")
+        if len(messages) < 2:  # covers both the empty case and the 1-message case
+            logger.warning(f"⚠️ {channel.name} has fewer than 2 messages after 5 seconds.")
             return
 
         # Usually the second message contains the mentions (kinda broken if its not ig)
@@ -161,7 +167,7 @@ async def send_alert(queue_type, origin_channel, mentions, dest_id):
 # 🏆 TOURNAMENT DETECTION/ALERT LOGIC
 # ==============================================================================
 
-def fetch_tournaments(region):
+async def fetch_tournaments(region):
     logger.info(f"Fetching tournaments for region, inside time range for: {region}")
     url = f"https://rocket-league1.p.rapidapi.com/tournaments/{region}"
     
@@ -173,9 +179,10 @@ def fetch_tournaments(region):
         "User-Agent": "RapidAPI Playground",
         "Accept-Encoding": "identity"
     }
-    
-    response = requests.get(url, headers=headers)
-    return response.json()
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url, headers=headers) as response:
+            return await response.json()
 
 def find_dropshot_tournament(data):
     for tournament in data.get('tournaments', []):
@@ -208,11 +215,11 @@ async def europe_dropshot_check():
         # print("Not in EUROPE check window")
         return
 
-announced_tournaments = set()
+
 
 async def check_dropshot_for_region(region: str, display_name: str):
     try:
-        data = fetch_tournaments(region)
+        data = await fetch_tournaments(region)
         tournament = find_dropshot_tournament(data)
 
         if tournament:
